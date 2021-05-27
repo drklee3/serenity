@@ -175,7 +175,7 @@ impl<'a> Future for HttpBuilder<'a> {
             #[cfg(feature = "unstable_discord_api")]
             let application_id = self
                 .application_id
-                .expect("Expected application Id in order to use slash commands");
+                .unwrap_or(0);
 
             let client = self.client.take().unwrap_or_else(|| {
                 let builder = configure_client_backend(Client::builder());
@@ -191,7 +191,7 @@ impl<'a> Future for HttpBuilder<'a> {
             let proxy = self.proxy.take();
 
             self.fut = Some(Box::pin(async move {
-                Ok(Http {
+                let mut http = Http {
                     client,
                     ratelimiter,
                     ratelimiter_disabled,
@@ -199,7 +199,14 @@ impl<'a> Future for HttpBuilder<'a> {
                     token,
                     #[cfg(feature = "unstable_discord_api")]
                     application_id,
-                })
+                };
+
+                #[cfg(feature = "unstable_discord_api")]
+                if http.application_id == 0 {
+                    http.application_id = http.get_current_application_info().await?.id.0;
+                }
+
+                Ok(http)
             }))
         }
 
