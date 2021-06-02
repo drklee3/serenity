@@ -41,7 +41,7 @@ pub struct Interaction {
     pub data: Option<InteractionData>,
     /// The message this interaction was triggered by, if
     /// it is a component.
-    pub message: Option<Message>,
+    pub message: Option<InteractionMessage>,
     /// The guild Id this interaction was sent from, if there is one.
     pub guild_id: Option<GuildId>,
     /// The channel Id this interaction was sent from, if there is one.
@@ -358,12 +358,26 @@ impl<'de> Deserialize<'de> for Interaction {
         };
 
         let message = match map.contains_key("message") {
-            true => Some(
-                map.remove("message")
+            true => {
+                let message = map
+                    .remove("message")
                     .ok_or_else(|| DeError::custom("expected message"))
-                    .and_then(Message::deserialize)
-                    .map_err(DeError::custom)?,
-            ),
+                    .and_then(JsonMap::deserialize)
+                    .map_err(DeError::custom)?;
+                let partial = !message.contains_key("author");
+
+                let value: Value = message.into();
+
+                if partial {
+                    Some(InteractionMessage::Ephemeral(
+                        EphemeralMessage::deserialize(value).map_err(DeError::custom)?,
+                    ))
+                } else {
+                    Some(InteractionMessage::Regular(
+                        Message::deserialize(value).map_err(DeError::custom)?,
+                    ))
+                }
+            },
             false => None,
         };
 
@@ -441,6 +455,9 @@ pub struct MessageComponent {
     pub custom_id: String,
     /// The type of the component.
     pub component_type: ComponentType,
+    /// The given values of the [`SelectMenu`]s
+    #[serde(default)]
+    pub values: Vec<String>,
 }
 
 /// The command data payload.
@@ -500,6 +517,67 @@ impl<'de> Deserialize<'de> for ApplicationCommandInteractionData {
             resolved,
         })
     }
+}
+
+/// The [`Interaction::message`] field.
+#[derive(Clone, Debug, Deserialize)]
+pub enum InteractionMessage {
+    Regular(Message),
+    Ephemeral(EphemeralMessage),
+}
+
+impl InteractionMessage {
+    /// Whether the message is ephemeral.
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(self, InteractionMessage::Ephemeral(_))
+    }
+
+    /// Gets the message Id.
+    pub fn id(&self) -> MessageId {
+        match self {
+            InteractionMessage::Regular(m) => m.id,
+            InteractionMessage::Ephemeral(m) => m.id,
+        }
+    }
+
+    /// Converts this to a regular message,
+    /// if it is one.
+    pub fn regular(self) -> Option<Message> {
+        match self {
+            InteractionMessage::Regular(m) => Some(m),
+            InteractionMessage::Ephemeral(_) => None,
+        }
+    }
+
+    /// Converts this to an ephemeral message,
+    /// if it is one.
+    pub fn ephemeral(self) -> Option<EphemeralMessage> {
+        match self {
+            InteractionMessage::Regular(_) => None,
+            InteractionMessage::Ephemeral(m) => Some(m),
+        }
+    }
+}
+
+impl Serialize for InteractionMessage {
+    fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            InteractionMessage::Regular(c) => Message::serialize(c, serializer),
+            InteractionMessage::Ephemeral(c) => EphemeralMessage::serialize(c, serializer),
+        }
+    }
+}
+
+/// An ephemeral message given in an interaction.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EphemeralMessage {
+    /// The message flags.
+    pub flags: MessageFlags,
+    /// The message Id.
+    pub id: MessageId,
 }
 
 /// The resolved data of a command data interaction payload.
@@ -952,7 +1030,7 @@ pub enum InteractionResponseType {
 }
 
 /// The flags for an interaction response.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct InteractionApplicationCommandCallbackDataFlags {
     bits: u64,
@@ -1036,6 +1114,7 @@ impl From<CommandPermissionId> for UserId {
 pub enum Component {
     ActionRow(ActionRow),
     Button(Button),
+    SelectMenu(SelectMenu),
 }
 
 impl<'de> Deserialize<'de> for Component {
@@ -1055,6 +1134,9 @@ impl<'de> Deserialize<'de> for Component {
             ComponentType::Button => serde_json::from_value::<Button>(Value::Object(map))
                 .map(Component::Button)
                 .map_err(DeError::custom),
+            ComponentType::SelectMenu => serde_json::from_value::<SelectMenu>(Value::Object(map))
+                .map(Component::SelectMenu)
+                .map_err(DeError::custom),
             ComponentType::Unknown => Err(DeError::custom("Unknown component type")),
         }
     }
@@ -1068,6 +1150,7 @@ impl Serialize for Component {
         match self {
             Component::ActionRow(c) => ActionRow::serialize(c, serializer),
             Component::Button(c) => Button::serialize(c, serializer),
+            Component::SelectMenu(c) => SelectMenu::serialize(c, serializer),
         }
     }
 }
@@ -1079,12 +1162,14 @@ impl Serialize for Component {
 pub enum ComponentType {
     ActionRow = 1,
     Button = 2,
+    SelectMenu = 3,
     Unknown = !0,
 }
 
 enum_number!(ComponentType {
     ActionRow,
-    Button
+    Button,
+    SelectMenu
 });
 
 /// An action row.
@@ -1138,3 +1223,37 @@ enum_number!(ButtonStyle {
     Danger,
     Link
 });
+
+/// A select menu component.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SelectMenu {
+    /// The component type, it will always be [`ComponentType::SelectMenu`].
+    #[serde(rename = "type")]
+    pub kind: ComponentType,
+    /// The placeholder shown when nothing is selected.
+    pub placeholder: Option<String>,
+    /// An identifier defined by the developer for the select menu.
+    pub custom_id: Option<String>,
+    /// The minimum number of selections allowed.
+    pub min_values: Option<u64>,
+    /// The maximum number of selections allowed.
+    pub max_values: Option<u64>,
+    /// The options of this select menu.
+    #[serde(default)]
+    pub options: Vec<SelectMenuOption>,
+}
+
+/// A select menu component options.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SelectMenuOption {
+    /// The text displayed on this option.
+    pub label: String,
+    /// The value to be sent for this option.
+    pub value: String,
+    /// The description shown for this option.
+    pub description: Option<String>,
+    /// The emoji displayed on this option.
+    pub emoji: Option<ReactionType>,
+    /// Render this option as the default selection.
+    pub default: bool,
+}
